@@ -17,11 +17,16 @@
 package docker
 
 import (
+	"context"
 	"crypto/tls"
 	"errors"
 	"net"
 	"net/http"
+	"os"
+	"strings"
 	"time"
+
+	"sigs.k8s.io/yaml"
 )
 
 // HostCapabilities represent the capabilities of the registry
@@ -44,6 +49,14 @@ import (
 // | Private Mirror   | yes  | yes     | no   |
 type HostCapabilities uint8
 
+// KubeletConfiguration contains the configuration for the Kubelet
+type KubeletConfiguration struct {
+	// clusterDNS is a list of IP addresses for the cluster DNS server. If set,
+	// kubelet will configure all containers to use this for DNS resolution
+	// instead of the host's DNS servers.
+	ClusterDNS []string `json:"clusterDNS,omitempty"`
+}
+
 const (
 	// HostCapabilityPull represents the capability to fetch manifests
 	// and blobs by digest
@@ -56,6 +69,22 @@ const (
 	// HostCapabilityPush represents the capability to push blobs and
 	// manifests
 	HostCapabilityPush
+
+	// KubeletRunDirectory specifies the directory where the kubelet runtime information is stored.
+	KubeletRunDirectory = "/var/lib/kubelet"
+
+	// KubeletConfigurationFileName specifies the file name on the node which stores initial remote configuration of kubelet
+	// This file should exist under KubeletRunDirectory
+	KubeletConfigurationFileName = "config.yaml"
+
+	// KubeletConfigurationFilePath is the absolute path to the kubelet configuration file
+	KubeletConfigurationFilePath = KubeletRunDirectory + "/" + KubeletConfigurationFileName
+
+	// DNSServerPort is the default port for DNS servers
+	DNSServerPort = "53"
+
+	// resolvConfPath is the abs path of resolv.conf on host or container.
+	resolvConfPath = "/etc/resolv.conf"
 
 	// Reserved for future capabilities (i.e. search, catalog, remove)
 )
@@ -247,14 +276,92 @@ func MatchLocalhost(host string) (bool, error) {
 	return ip.IsLoopback(), nil
 }
 
+func getKubeletClusterDNS(kubeletConfigPath string) ([]string, error) {
+	var config KubeletConfiguration
+	data, err := os.ReadFile(kubeletConfigPath)
+	if err != nil {
+		return nil, err
+	}
+	unmarshalErr := yaml.Unmarshal(data, &config)
+	if unmarshalErr != nil {
+		return nil, unmarshalErr
+	}
+	return config.ClusterDNS, nil
+}
+
+func getSystemResolvers(resolvConfPath string) ([]string, error) {
+	data, err := os.ReadFile(resolvConfPath)
+	if err != nil {
+		return nil, err
+	}
+
+	var resolvers []string
+	lines := strings.Split(string(data), "\n")
+	for _, line := range lines {
+		line = strings.TrimSpace(line)
+		if strings.HasPrefix(line, "nameserver ") {
+			fields := strings.Fields(line)
+			if len(fields) == 2 {
+				resolvers = append(resolvers, fields[1])
+			}
+		}
+	}
+	return resolvers, nil
+}
+
+func newDialResolver(servers []string) *net.Resolver {
+	return &net.Resolver{
+		PreferGo: true,
+		Dial: func(ctx context.Context, network, _ string) (net.Conn, error) {
+			var lastErr error
+			for _, ip := range servers {
+				addr := net.JoinHostPort(ip, DNSServerPort)
+				conn, err := (&net.Dialer{}).DialContext(ctx, network, addr)
+				if err == nil {
+					return conn, nil
+				}
+				lastErr = err
+			}
+			return nil, lastErr
+		},
+	}
+}
+
+func newDialContext() *net.Dialer {
+	var resolvers []string
+	kubeletResolvers, err := getKubeletClusterDNS(KubeletConfigurationFilePath)
+	if err == nil {
+		resolvers = append(resolvers, kubeletResolvers...)
+	}
+	systemResolvers, err := getSystemResolvers(resolvConfPath)
+	if err == nil {
+		resolvers = append(resolvers, systemResolvers...)
+	}
+	var r *net.Resolver
+	if len(resolvers) != 0 {
+		r = newDialResolver(resolvers)
+	}
+
+	d := &net.Dialer{
+		Timeout:       30 * time.Second,
+		KeepAlive:     30 * time.Second,
+		FallbackDelay: 300 * time.Millisecond,
+	}
+
+	if r != nil {
+		d.Resolver = r
+	}
+
+	return d
+}
 func DefaultHTTPTransport(defaultTLSConfig *tls.Config) *http.Transport {
+	dialer := newDialContext()
+	if dialer == nil {
+		dialer = &net.Dialer{}
+	}
 	return &http.Transport{
-		Proxy: http.ProxyFromEnvironment,
-		DialContext: (&net.Dialer{
-			Timeout:       30 * time.Second,
-			KeepAlive:     30 * time.Second,
-			FallbackDelay: 300 * time.Millisecond,
-		}).DialContext,
+		Proxy:                 http.ProxyFromEnvironment,
+		DialContext:           dialer.DialContext,
 		MaxIdleConns:          10,
 		IdleConnTimeout:       30 * time.Second,
 		TLSHandshakeTimeout:   10 * time.Second,
