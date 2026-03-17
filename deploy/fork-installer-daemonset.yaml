@@ -1,0 +1,84 @@
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: containerd-installer
+  namespace: kube-system
+  labels:
+    app: containerd-installer
+spec:
+  selector:
+    matchLabels:
+      app: containerd-installer
+  template:
+    metadata:
+      labels:
+        app: containerd-installer
+    spec:
+      automountServiceAccountToken: false
+      terminationGracePeriodSeconds: 1
+      hostPID: true
+      tolerations:
+        - operator: Exists
+      initContainers:
+        - name: installer
+          image: alpine:3.19
+          securityContext:
+            privileged: true
+          # env:
+          #   - name: RELEASE_URL
+          #     value: "https://github.com/ChandonPierre/containerd/releases/download/v2.2.2-abc1234/containerd-v2.2.2-abc1234-linux-amd64.tar.gz"
+          command:
+            - /bin/sh
+            - -c
+            - |
+              set -e
+              ARCH=$(uname -m | sed 's/x86_64/amd64/;s/aarch64/arm64/')
+              if [ -n "$RELEASE_URL" ]; then
+                RELEASE_VERSION=$(basename "$(dirname "$RELEASE_URL")")
+              else
+                API_RESPONSE=$(wget -qO- "https://api.github.com/repos/ChandonPierre/containerd/releases")
+                RELEASE_URL=$(echo "$API_RESPONSE" | grep -o '"browser_download_url":"[^"]*linux-'"$ARCH"'[^"]*"' | head -1 | grep -o 'https://[^"]*')
+                RELEASE_VERSION=$(echo "$API_RESPONSE" | grep -o '"tag_name":"[^"]*"' | head -1 | grep -o 'v[^"]*')
+              fi
+              MARKER="/host/var/lib/containerd-installer/version"
+
+              if [ -f "$MARKER" ] && [ "$(cat $MARKER)" = "$RELEASE_VERSION" ]; then
+                echo "already at $RELEASE_VERSION, skipping"
+                exit 0
+              fi
+
+              INSTALL_DIR="/host$(dirname $(nsenter --mount=/proc/1/ns/mnt -- which containerd))"
+
+              echo "Downloading $RELEASE_VERSION to $INSTALL_DIR..."
+              wget -q -O /tmp/containerd.tar.gz "$RELEASE_URL"
+              tar -xzf /tmp/containerd.tar.gz --strip-components=1 -C "$INSTALL_DIR"
+              chmod +x "$INSTALL_DIR"/containerd*
+
+              mkdir -p "$(dirname $MARKER)"
+              echo "$RELEASE_VERSION" > "$MARKER"
+
+              echo "Restarting containerd..."
+              nsenter --mount=/proc/1/ns/mnt -- systemctl restart containerd
+          volumeMounts:
+            - name: host-root
+              mountPath: /host
+          resources:
+            requests:
+              cpu: 10m
+              memory: 64Mi
+      containers:
+        - name: pause
+          image: registry.k8s.io/pause:3.10
+          resources: {}
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop:
+              - ALL
+            readOnlyRootFilesystem: true
+            runAsNonRoot: true
+            runAsUser: 65534
+      volumes:
+        - name: host-root
+          hostPath:
+            path: /

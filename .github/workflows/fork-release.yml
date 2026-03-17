@@ -1,0 +1,72 @@
+name: Fork Build
+
+on:
+  push:
+    branches-ignore:
+      - main
+      - 'release/**'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: Build Binaries
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 # v6.0.1
+        with:
+          fetch-depth: 0
+
+      - uses: ./.github/actions/install-go
+
+      - name: Compute version
+        id: meta
+        shell: bash
+        run: |
+          git fetch https://github.com/containerd/containerd.git '+refs/tags/*:refs/tags/upstream/*'
+          LAST_TAG=$(git tag -l 'upstream/v*' | sed 's|upstream/||' | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' | sort -V | tail -1)
+          SHORT_SHA=$(git rev-parse --short HEAD)
+          echo "version=${LAST_TAG}-${SHORT_SHA}" >> $GITHUB_OUTPUT
+
+      - name: Install cross-compilation dependencies
+        run: |
+          sudo apt-get update || true
+          sudo apt-get install -y crossbuild-essential-arm64
+
+      - name: Build linux/amd64
+        env:
+          GOOS: linux
+          GOARCH: amd64
+          VERSION: ${{ steps.meta.outputs.version }}
+        run: make binaries
+
+      - name: Package linux/amd64
+        run: tar -czf /tmp/containerd-${{ steps.meta.outputs.version }}-linux-amd64.tar.gz bin/
+
+      - name: Build linux/arm64
+        env:
+          GOOS: linux
+          GOARCH: arm64
+          CGO_ENABLED: 1
+          CC: aarch64-linux-gnu-gcc
+          VERSION: ${{ steps.meta.outputs.version }}
+        run: make binaries
+
+      - name: Package linux/arm64
+        run: tar -czf /tmp/containerd-${{ steps.meta.outputs.version }}-linux-arm64.tar.gz bin/
+
+      - name: Create GitHub Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release create ${{ steps.meta.outputs.version }} \
+            --repo ${{ github.repository }} \
+            --title "containerd ${{ steps.meta.outputs.version }}" \
+            --notes "Branch: \`${{ github.ref_name }}\`  Commit: \`${{ github.sha }}\`" \
+            --prerelease \
+            /tmp/containerd-${{ steps.meta.outputs.version }}-linux-amd64.tar.gz \
+            /tmp/containerd-${{ steps.meta.outputs.version }}-linux-arm64.tar.gz
